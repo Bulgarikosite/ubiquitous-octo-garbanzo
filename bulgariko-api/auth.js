@@ -238,10 +238,11 @@ function publicUser(user) {
     createdAt: obj.createdAt,
     friendsCount: Array.isArray(obj.friends) ? obj.friends.length : 0,
     avatar: {
-      head: saved.bodyColorHead || "#f5cba7",
-      limbs: saved.bodyColorLimbs || "#85c1e9",
-      acc: saved.equippedAcc || [],
-      clothing: saved.equippedClothing || []
+      // Prefer real schema fields, fall back to legacy data.user blob
+      head: obj.bodyColorHead || saved.bodyColorHead || "#f5cba7",
+      limbs: obj.bodyColorLimbs || saved.bodyColorLimbs || "#85c1e9",
+      acc: (Array.isArray(obj.equippedAcc) ? obj.equippedAcc : null) || saved.equippedAcc || [],
+      clothing: (Array.isArray(obj.equippedClothing) ? obj.equippedClothing : null) || saved.equippedClothing || []
     }
   };
 }
@@ -274,6 +275,16 @@ function buildUserPayload(user) {
   const schemaRequests = (obj.friendRequests || []).map(mapUserRef);
   const schemaBlocked = (obj.blockedUsers || []).map(mapUserRef);
 
+  // Prefer real schema fields for avatar; fall back to legacy data.user blob
+  const bodyColorHead   = obj.bodyColorHead   || saved.bodyColorHead   || "#f5cba7";
+  const bodyColorLimbs  = obj.bodyColorLimbs  || saved.bodyColorLimbs  || "#85c1e9";
+  const equippedAcc     = (Array.isArray(obj.equippedAcc) && obj.equippedAcc.length > 0)
+    ? obj.equippedAcc
+    : (saved.equippedAcc || []);
+  const equippedClothing = (Array.isArray(obj.equippedClothing) && obj.equippedClothing.length > 0)
+    ? obj.equippedClothing
+    : (saved.equippedClothing || []);
+
   return {
     id: String(obj._id),
     _id: String(obj._id),
@@ -286,14 +297,16 @@ function buildUserPayload(user) {
     points: obj.points || obj.tickets || 0,
     ...dataPayload,
     inventory: obj.inventory || data.inventory || [],
-    bodyColorHead: saved.bodyColorHead || data.bodyColorHead || "#f5cba7",
-    bodyColorLimbs: saved.bodyColorLimbs || data.bodyColorLimbs || "#85c1e9",
-    equippedAcc: saved.equippedAcc || data.equippedAcc || [],
-    equippedClothing: saved.equippedClothing || data.equippedClothing || [],
+    bodyColorHead,
+    bodyColorLimbs,
+    equippedAcc,
+    equippedClothing,
 
-friends: mergeUniquePlayers(schemaFriends, data.friends || []),
-friendRequests: mergeUniquePlayers(schemaRequests, data.friendRequests || []),
-blockedUsers: mergeUniquePlayers(schemaBlocked, data.blockedUsers || [])
+    friends: mergeUniquePlayers(schemaFriends, data.friends || []),
+    friendRequests: mergeUniquePlayers(schemaRequests, data.friendRequests || []),
+    blockedUsers: mergeUniquePlayers(schemaBlocked, data.blockedUsers || []),
+    // sentFriendRequests lives in data blob; expose it so the frontend can check
+    sentFriendRequests: data.sentFriendRequests || [],
   };
 }
 
@@ -471,6 +484,12 @@ router.put("/data", auth, async (req, res) => {
     const payload = req.body.data || req.body || {};
     const dataPayload = { ...payload };
 
+    // If the payload includes inventory, write it to the real schema field
+    if (Array.isArray(dataPayload.inventory)) {
+      user.inventory = dataPayload.inventory;
+      delete dataPayload.inventory;
+    }
+
     if (dataPayload.user) {
       const allowed = ['name', 'username', 'bio', 'bcoins', 'bucks', 'robux', 'points', 'tickets', 'bodyColorHead', 'bodyColorLimbs', 'equippedAccessory', 'equippedAcc', 'equippedClothing'];
       const savedUserData = {};
@@ -491,10 +510,10 @@ router.put("/data", auth, async (req, res) => {
           } else if (key === 'bio') {
             user.bio = String(dataPayload.user[key] || "").slice(0, 500);
             savedUserData.bio = user.bio;
-        } else {
-    user[key] = dataPayload.user[key];
-    savedUserData[key] = dataPayload.user[key];
-}
+          } else {
+            user[key] = dataPayload.user[key];
+            savedUserData[key] = dataPayload.user[key];
+          }
         }
       });
       user.data = { ...(user.data || {}), user: { ...((user.data && user.data.user) || {}), ...savedUserData } };
@@ -518,6 +537,12 @@ router.patch("/data", auth, async (req, res) => {
     const payload = req.body.data || req.body || {};
     const dataPayload = { ...payload };
 
+    // If the patch includes inventory, write it to the real schema field
+    if (Array.isArray(dataPayload.inventory)) {
+      user.inventory = dataPayload.inventory;
+      delete dataPayload.inventory;
+    }
+
     if (dataPayload.user) {
       const allowed = ['name', 'username', 'bio', 'bcoins', 'bucks', 'robux', 'points', 'tickets', 'bodyColorHead', 'bodyColorLimbs', 'equippedAccessory', 'equippedAcc', 'equippedClothing'];
       const savedUserData = {};
@@ -538,10 +563,11 @@ router.patch("/data", auth, async (req, res) => {
           } else if (key === 'bio') {
             user.bio = String(dataPayload.user[key] || "").slice(0, 500);
             savedUserData.bio = user.bio;
-       } else {
-    user[key] = dataPayload.user[key];
-    savedUserData[key] = dataPayload.user[key];
-}
+          } else {
+            // equippedAcc, equippedClothing, bodyColorHead, bodyColorLimbs
+            user[key] = dataPayload.user[key];
+            savedUserData[key] = dataPayload.user[key];
+          }
         }
       });
       user.data = { ...(user.data || {}), user: { ...((user.data && user.data.user) || {}), ...savedUserData } };
@@ -661,6 +687,20 @@ router.post("/friends/request", auth, async (req, res) => {
     target.friendRequests.push(req.user.id);
     await target.save();
 
+    // Track sent request in sender's data blob so it survives a reload
+    const sentList = (me.data && me.data.sentFriendRequests) || [];
+    const alreadySent = sentList.some(r => String(r.id) === String(target._id));
+    if (!alreadySent) {
+      me.data = {
+        ...(me.data || {}),
+        sentFriendRequests: [
+          ...sentList,
+          { id: String(target._id), name: target.username, date: new Date().toLocaleDateString() }
+        ]
+      };
+      await me.save();
+    }
+
     return res.json({ message: "Request sent" });
 
   } catch (err) {
@@ -697,6 +737,13 @@ router.post("/friends/accept", auth, async (req, res) => {
     if (!(fromUser.friends || []).some(id => id?.toString() === me._id.toString())) {
       fromUser.friends.push(me._id);
     }
+
+    // Clear the accepted request from the requester's sentFriendRequests
+    fromUser.data = {
+      ...(fromUser.data || {}),
+      sentFriendRequests: ((fromUser.data && fromUser.data.sentFriendRequests) || [])
+        .filter(r => String(r.id) !== String(me._id))
+    };
 
     await me.save();
     await fromUser.save();
@@ -828,26 +875,28 @@ router.post("/accessories/buy", auth, async (req, res) => {
 
     user.bcoins -= item.price;
 
+    // Check by both _id and itemId to avoid duplicates
     const owned = (user.inventory || []).some(
-      i => String(i.id) === String(accessoryId)
+      i => String(i.id) === String(accessoryId) || String(i.itemId) === String(accessoryId)
     );
 
     if (!owned) {
       user.inventory.push({
-        id: String(item._id),
-        name: item.name,
-        type: item.type || "accessory",
-        icon: item.img || "",
-        rarity: "Common",
-        equipped: false
+        id:          String(item._id),
+        itemId:      String(item._id),   // frontend isOwned() checks itemId
+        name:        item.name,
+        type:        item.type || "accessory",
+        icon:        item.img || "",
+        rarity:      "Common",
+        equipped:    false
       });
     }
 
     await user.save();
 
     res.json({
-      success: true,
-      bcoins: user.bcoins,
+      success:   true,
+      bcoins:    user.bcoins,
       inventory: user.inventory
     });
 
