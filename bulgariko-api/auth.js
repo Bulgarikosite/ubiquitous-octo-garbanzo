@@ -64,11 +64,11 @@ const UserSchema = new mongoose.Schema({
     type: Number,
     default: 0
   },
-  
+
   bcoins: {
-  type: Number,
-  default: 0
-},
+    type: Number,
+    default: 0
+  },
 
   // PLAYER INVENTORY
   inventory: [{
@@ -100,7 +100,6 @@ const UserSchema = new mongoose.Schema({
       type: Boolean,
       default: false
     },
-
 
     purchasedAt: {
       type: Date,
@@ -238,11 +237,10 @@ function publicUser(user) {
     createdAt: obj.createdAt,
     friendsCount: Array.isArray(obj.friends) ? obj.friends.length : 0,
     avatar: {
-      // Prefer real schema fields, fall back to legacy data.user blob
-      head: obj.bodyColorHead || saved.bodyColorHead || "#f5cba7",
-      limbs: obj.bodyColorLimbs || saved.bodyColorLimbs || "#85c1e9",
-      acc: (Array.isArray(obj.equippedAcc) ? obj.equippedAcc : null) || saved.equippedAcc || [],
-      clothing: (Array.isArray(obj.equippedClothing) ? obj.equippedClothing : null) || saved.equippedClothing || []
+      head: saved.bodyColorHead || "#f5cba7",
+      limbs: saved.bodyColorLimbs || "#85c1e9",
+      acc: saved.equippedAcc || [],
+      clothing: saved.equippedClothing || []
     }
   };
 }
@@ -275,16 +273,6 @@ function buildUserPayload(user) {
   const schemaRequests = (obj.friendRequests || []).map(mapUserRef);
   const schemaBlocked = (obj.blockedUsers || []).map(mapUserRef);
 
-  // Prefer real schema fields for avatar; fall back to legacy data.user blob
-  const bodyColorHead   = obj.bodyColorHead   || saved.bodyColorHead   || "#f5cba7";
-  const bodyColorLimbs  = obj.bodyColorLimbs  || saved.bodyColorLimbs  || "#85c1e9";
-  const equippedAcc     = (Array.isArray(obj.equippedAcc) && obj.equippedAcc.length > 0)
-    ? obj.equippedAcc
-    : (saved.equippedAcc || []);
-  const equippedClothing = (Array.isArray(obj.equippedClothing) && obj.equippedClothing.length > 0)
-    ? obj.equippedClothing
-    : (saved.equippedClothing || []);
-
   return {
     id: String(obj._id),
     _id: String(obj._id),
@@ -297,16 +285,14 @@ function buildUserPayload(user) {
     points: obj.points || obj.tickets || 0,
     ...dataPayload,
     inventory: obj.inventory || data.inventory || [],
-    bodyColorHead,
-    bodyColorLimbs,
-    equippedAcc,
-    equippedClothing,
+    bodyColorHead: saved.bodyColorHead || data.bodyColorHead || "#f5cba7",
+    bodyColorLimbs: saved.bodyColorLimbs || data.bodyColorLimbs || "#85c1e9",
+    equippedAcc: saved.equippedAcc || data.equippedAcc || [],
+    equippedClothing: saved.equippedClothing || data.equippedClothing || [],
 
     friends: mergeUniquePlayers(schemaFriends, data.friends || []),
     friendRequests: mergeUniquePlayers(schemaRequests, data.friendRequests || []),
-    blockedUsers: mergeUniquePlayers(schemaBlocked, data.blockedUsers || []),
-    // sentFriendRequests lives in data blob; expose it so the frontend can check
-    sentFriendRequests: data.sentFriendRequests || [],
+    blockedUsers: mergeUniquePlayers(schemaBlocked, data.blockedUsers || [])
   };
 }
 
@@ -375,6 +361,7 @@ router.post("/guest", async (req, res) => {
     res.status(500).json({ message: "Guest creation failed" });
   }
 });
+
 router.post("/register", async (req, res) => {
   try {
     const username = cleanUsername(req.body.username);
@@ -476,6 +463,10 @@ router.get("/me", auth, async (req, res) => {
   }
 });
 
+/* =========================
+   PUT /data  (full save — used by save())
+========================= */
+
 router.put("/data", auth, async (req, res) => {
   try {
     const user = await User.findById(req.user.id);
@@ -483,12 +474,6 @@ router.put("/data", auth, async (req, res) => {
 
     const payload = req.body.data || req.body || {};
     const dataPayload = { ...payload };
-
-    // If the payload includes inventory, write it to the real schema field
-    if (Array.isArray(dataPayload.inventory)) {
-      user.inventory = dataPayload.inventory;
-      delete dataPayload.inventory;
-    }
 
     if (dataPayload.user) {
       const allowed = ['name', 'username', 'bio', 'bcoins', 'bucks', 'robux', 'points', 'tickets', 'bodyColorHead', 'bodyColorLimbs', 'equippedAccessory', 'equippedAcc', 'equippedClothing'];
@@ -503,10 +488,13 @@ router.put("/data", auth, async (req, res) => {
           } else if (key === 'tickets' || key === 'points') {
             user.points = Number(dataPayload.user[key]) || 0;
             savedUserData.points = user.points;
-          } else if (key === 'username' || key === 'name') {
+          } else if (key === 'username') {
             user.username = cleanUsername(dataPayload.user[key]) || user.username;
             savedUserData.username = user.username;
             savedUserData.name = user.username;
+          } else if (key === 'name') {
+            // display-name only — never touches the real schema username field
+            savedUserData.name = String(dataPayload.user[key] || user.username).slice(0, 32);
           } else if (key === 'bio') {
             user.bio = String(dataPayload.user[key] || "").slice(0, 500);
             savedUserData.bio = user.bio;
@@ -525,9 +513,14 @@ router.put("/data", auth, async (req, res) => {
 
     return res.json({ success: true, data: user.data });
   } catch (err) {
+    console.error("PUT /data ERROR:", err);
     return res.status(500).json({ message: "Server error" });
   }
 });
+
+/* =========================
+   PATCH /data  (partial save — used by patch(), e.g. buy/equip)
+========================= */
 
 router.patch("/data", auth, async (req, res) => {
   try {
@@ -537,12 +530,6 @@ router.patch("/data", auth, async (req, res) => {
     const payload = req.body.data || req.body || {};
     const dataPayload = { ...payload };
 
-    // If the patch includes inventory, write it to the real schema field
-    if (Array.isArray(dataPayload.inventory)) {
-      user.inventory = dataPayload.inventory;
-      delete dataPayload.inventory;
-    }
-
     if (dataPayload.user) {
       const allowed = ['name', 'username', 'bio', 'bcoins', 'bucks', 'robux', 'points', 'tickets', 'bodyColorHead', 'bodyColorLimbs', 'equippedAccessory', 'equippedAcc', 'equippedClothing'];
       const savedUserData = {};
@@ -556,15 +543,17 @@ router.patch("/data", auth, async (req, res) => {
           } else if (key === 'tickets' || key === 'points') {
             user.points = Number(dataPayload.user[key]) || 0;
             savedUserData.points = user.points;
-          } else if (key === 'username' || key === 'name') {
+          } else if (key === 'username') {
             user.username = cleanUsername(dataPayload.user[key]) || user.username;
             savedUserData.username = user.username;
             savedUserData.name = user.username;
+          } else if (key === 'name') {
+            // display-name only — never touches the real schema username field
+            savedUserData.name = String(dataPayload.user[key] || user.username).slice(0, 32);
           } else if (key === 'bio') {
             user.bio = String(dataPayload.user[key] || "").slice(0, 500);
             savedUserData.bio = user.bio;
           } else {
-            // equippedAcc, equippedClothing, bodyColorHead, bodyColorLimbs
             user[key] = dataPayload.user[key];
             savedUserData[key] = dataPayload.user[key];
           }
@@ -579,6 +568,7 @@ router.patch("/data", auth, async (req, res) => {
 
     return res.json({ success: true, data: user.data });
   } catch (err) {
+    console.error("PATCH /data ERROR:", err);
     return res.status(500).json({ message: "Server error" });
   }
 });
@@ -633,7 +623,6 @@ router.post('/exchange-points', auth, async (req, res) => {
 
     const usedPoints = bcoinsGain * POINTS_PER_BCOIN;
 
-    // Subtract points from whichever storage is used
     if (typeof user.points === 'number') {
       user.points = (user.points || 0) - usedPoints;
     } else if (user.tickets !== undefined) {
@@ -653,7 +642,7 @@ router.post('/exchange-points', auth, async (req, res) => {
 });
 
 /* =========================
-   FRIEND REQUEST (FIXED SAFE)
+   FRIEND REQUEST
 ========================= */
 
 router.post("/friends/request", auth, async (req, res) => {
@@ -687,20 +676,6 @@ router.post("/friends/request", auth, async (req, res) => {
     target.friendRequests.push(req.user.id);
     await target.save();
 
-    // Track sent request in sender's data blob so it survives a reload
-    const sentList = (me.data && me.data.sentFriendRequests) || [];
-    const alreadySent = sentList.some(r => String(r.id) === String(target._id));
-    if (!alreadySent) {
-      me.data = {
-        ...(me.data || {}),
-        sentFriendRequests: [
-          ...sentList,
-          { id: String(target._id), name: target.username, date: new Date().toLocaleDateString() }
-        ]
-      };
-      await me.save();
-    }
-
     return res.json({ message: "Request sent" });
 
   } catch (err) {
@@ -709,7 +684,7 @@ router.post("/friends/request", auth, async (req, res) => {
 });
 
 /* =========================
-   FRIEND ACCEPT (SAFE FIX)
+   FRIEND ACCEPT
 ========================= */
 
 router.post("/friends/accept", auth, async (req, res) => {
@@ -737,13 +712,6 @@ router.post("/friends/accept", auth, async (req, res) => {
     if (!(fromUser.friends || []).some(id => id?.toString() === me._id.toString())) {
       fromUser.friends.push(me._id);
     }
-
-    // Clear the accepted request from the requester's sentFriendRequests
-    fromUser.data = {
-      ...(fromUser.data || {}),
-      sentFriendRequests: ((fromUser.data && fromUser.data.sentFriendRequests) || [])
-        .filter(r => String(r.id) !== String(me._id))
-    };
 
     await me.save();
     await fromUser.save();
@@ -846,7 +814,7 @@ router.post("/messages", auth, async (req, res) => {
 });
 
 /* =========================
-   ACCESSORIES SAFE
+   ACCESSORIES
 ========================= */
 
 router.get("/accessories", async (req, res) => {
@@ -875,33 +843,31 @@ router.post("/accessories/buy", auth, async (req, res) => {
 
     user.bcoins -= item.price;
 
-    // Check by both _id and itemId to avoid duplicates
     const owned = (user.inventory || []).some(
-      i => String(i.id) === String(accessoryId) || String(i.itemId) === String(accessoryId)
+      i => String(i.id) === String(accessoryId)
     );
 
     if (!owned) {
       user.inventory.push({
-        id:          String(item._id),
-        itemId:      String(item._id),   // frontend isOwned() checks itemId
-        name:        item.name,
-        type:        item.type || "accessory",
-        icon:        item.img || "",
-        rarity:      "Common",
-        equipped:    false
+        id: String(item._id),
+        name: item.name,
+        type: item.type || "accessory",
+        icon: item.img || "",
+        rarity: "Common",
+        equipped: false
       });
     }
 
     await user.save();
 
     res.json({
-      success:   true,
-      bcoins:    user.bcoins,
+      success: true,
+      bcoins: user.bcoins,
       inventory: user.inventory
     });
 
   } catch (err) {
-    console.error(err);
+    console.error("ACCESSORIES/BUY ERROR:", err);
     res.status(500).json({ message: "Server error" });
   }
 });
@@ -938,7 +904,7 @@ router.post("/accessories/equip", auth, async (req, res) => {
     });
 
   } catch (err) {
-    console.error(err);
+    console.error("ACCESSORIES/EQUIP ERROR:", err);
     res.status(500).json({ message: "Server error" });
   }
 });
